@@ -5,8 +5,8 @@ but adapted for Overmind's message-based (dict) conversation format.
 
 Patterns detected:
 1. Repeating action: LLM calls the same tool with same args N times
-2. Repeating observation: Tool returns the same result N times but LLM doesn't adjust
-3. Repeating error: Same error output N times (replaces old Sisyphus MD5 detection)
+2. Repeating observation: Same result from non-exploration tools N times
+3. Repeating error: Same error output from non-exploration tools N times
 4. Empty response: LLM returns empty content with no tool calls N times
 5. Action-observation pair loop: Same (tool_call, result) pair alternates in a cycle
 """
@@ -16,6 +16,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+from collections import Counter
 from dataclasses import dataclass
 
 log = logging.getLogger(__name__)
@@ -25,6 +26,23 @@ DEFAULT_REPEAT_THRESHOLD = 3
 # How many recent messages to scan (keeps cost low on long conversations)
 DEFAULT_SCAN_WINDOW = 30
 
+# Tools that represent read-only exploration — exempt from observation-based
+# stuck detection (Patterns 2 & 3).  An agent reading many files or polling
+# child status is researching, not stuck.
+EXPLORATION_TOOLS = frozenset({
+    "read_file", "list_directory", "search_files",
+    "screenshot", "list_windows", "find_window",
+    "get_child_result",
+})
+
+# Tool results that are effectively empty — many legitimate commands produce
+# no output (Start-Process, sleep, mkdir, environment setup, etc.).  These
+# should not count as "repeated observations" because the repetition is
+# meaningless; real stuck loops repeat a *substantive* output or error.
+EMPTY_RESULTS = frozenset({
+    "(no output)", "", "(empty directory)",
+})
+
 
 @dataclass
 class StuckResult:
@@ -33,6 +51,20 @@ class StuckResult:
     pattern: str = ""       # e.g. "repeating_action", "empty_response"
     repeat_count: int = 0
     detail: str = ""
+
+
+@dataclass
+class _ActionInfo:
+    """Internal: action hash paired with tool names in the batch."""
+    hash: str
+    tool_names: frozenset[str]
+
+
+@dataclass
+class _ObsInfo:
+    """Internal: observation hash paired with the tool that produced it."""
+    hash: str
+    tool_name: str
 
 
 class StuckDetector:
@@ -49,6 +81,10 @@ class StuckDetector:
     ):
         self.repeat_threshold = repeat_threshold
         self.scan_window = scan_window
+        # Pre-compute hashes for empty results so we can skip them cheaply
+        self._empty_hashes = frozenset(
+            self._observation_hash(r) for r in EMPTY_RESULTS
+        )
 
     def check(self, messages: list[dict]) -> StuckResult:
         """Check if the conversation shows signs of being stuck.
@@ -64,7 +100,8 @@ class StuckDetector:
 
         # Extract structured data from messages
         actions = self._extract_actions(window)
-        observations = self._extract_observations(window)
+        obs_infos = self._extract_observations_with_context(window)
+        obs_hashes = [o.hash for o in obs_infos]
         assistant_msgs = self._extract_assistant_messages(window)
 
         # Pattern 1: Repeating action (same tool call repeated)
@@ -73,12 +110,15 @@ class StuckDetector:
             return result
 
         # Pattern 2: Repeating observation (same tool result repeated)
-        result = self._check_repeating_observations(observations)
+        # Only checks non-exploration tools to avoid false positives
+        # when agents read many files or poll child status.
+        result = self._check_repeating_observations(obs_infos)
         if result.is_stuck:
             return result
 
         # Pattern 3: Repeating error in tool results
-        result = self._check_repeating_errors(observations)
+        # Only checks non-exploration tools.
+        result = self._check_repeating_errors(obs_infos)
         if result.is_stuck:
             return result
 
@@ -88,7 +128,7 @@ class StuckDetector:
             return result
 
         # Pattern 5: Action-observation pair cycle (A1,O1,A2,O2,A1,O1,A2,O2)
-        result = self._check_pair_cycle(actions, observations)
+        result = self._check_pair_cycle(actions, obs_hashes)
         if result.is_stuck:
             return result
 
@@ -110,22 +150,50 @@ class StuckDetector:
         """Hash tool result content."""
         return hashlib.md5(content.encode()).hexdigest()[:12]
 
-    def _extract_actions(self, messages: list[dict]) -> list[str]:
-        """Extract action hashes from assistant messages that have tool_calls."""
-        hashes = []
+    def _extract_actions(self, messages: list[dict]) -> list[_ActionInfo]:
+        """Extract action hashes with tool names from assistant messages."""
+        actions = []
         for msg in messages:
             if msg.get("role") == "assistant" and msg.get("tool_calls"):
-                hashes.append(self._action_hash(msg["tool_calls"]))
-        return hashes
+                tcs = msg["tool_calls"]
+                names = frozenset(
+                    tc.get("function", {}).get("name", "")
+                    for tc in tcs
+                )
+                actions.append(_ActionInfo(
+                    hash=self._action_hash(tcs),
+                    tool_names=names,
+                ))
+        return actions
 
-    def _extract_observations(self, messages: list[dict]) -> list[str]:
-        """Extract observation hashes from tool result messages."""
-        hashes = []
+    def _extract_observations_with_context(self, messages: list[dict]) -> list[_ObsInfo]:
+        """Extract observation hashes paired with the tool that produced them.
+
+        Maps each tool result message back to the tool name via tool_call_id,
+        so downstream checks can exclude exploration-only tools.
+        """
+        # Build tool_call_id → tool_name mapping from assistant messages
+        tc_id_to_name: dict[str, str] = {}
+        for msg in messages:
+            if msg.get("role") == "assistant":
+                for tc in msg.get("tool_calls", []):
+                    tc_id = tc.get("id", "")
+                    tc_name = tc.get("function", {}).get("name", "")
+                    if tc_id:
+                        tc_id_to_name[tc_id] = tc_name
+
+        # Extract observations with tool context
+        result: list[_ObsInfo] = []
         for msg in messages:
             if msg.get("role") == "tool":
                 content = msg.get("content", "")
-                hashes.append(self._observation_hash(content))
-        return hashes
+                tc_id = msg.get("tool_call_id", "")
+                tool_name = tc_id_to_name.get(tc_id, "unknown")
+                result.append(_ObsInfo(
+                    hash=self._observation_hash(content),
+                    tool_name=tool_name,
+                ))
+        return result
 
     @staticmethod
     def _extract_assistant_messages(messages: list[dict]) -> list[dict]:
@@ -134,13 +202,24 @@ class StuckDetector:
 
     # --- Pattern checks ---
 
-    def _check_repeating_actions(self, actions: list[str]) -> StuckResult:
-        """Pattern 1: Same tool call repeated N times in a row."""
+    def _check_repeating_actions(self, actions: list[_ActionInfo]) -> StuckResult:
+        """Pattern 1: Same tool call repeated N times in a row.
+
+        Skips detection when all tools in the repeated batch are exploration
+        tools (e.g. get_child_result polling), since repetition is expected.
+        """
         if len(actions) < self.repeat_threshold:
             return StuckResult(is_stuck=False)
 
         tail = actions[-self.repeat_threshold:]
-        if len(set(tail)) == 1:
+        if len(set(a.hash for a in tail)) == 1:
+            # If every tool in the repeated batch is an exploration tool, skip
+            all_exploration = all(
+                a.tool_names.issubset(EXPLORATION_TOOLS) for a in tail
+            )
+            if all_exploration:
+                return StuckResult(is_stuck=False)
+
             return StuckResult(
                 is_stuck=True,
                 pattern="repeating_action",
@@ -149,41 +228,55 @@ class StuckDetector:
             )
         return StuckResult(is_stuck=False)
 
-    def _check_repeating_observations(self, observations: list[str]) -> StuckResult:
-        """Pattern 2: Same tool result repeated N times."""
-        if len(observations) < self.repeat_threshold:
+    def _check_repeating_observations(self, obs_infos: list[_ObsInfo]) -> StuckResult:
+        """Pattern 2: Same tool result repeated N times (excludes exploration tools).
+
+        Exploration tools (read_file, list_directory, get_child_result, etc.)
+        are filtered out because sequential file reads or status polling are
+        normal research behaviour, not stuck loops.
+
+        Empty results like "(no output)" are also excluded — many legitimate
+        commands (Start-Process, sleep, mkdir) produce no output, and their
+        repetition is not a sign of being stuck.
+        """
+        actionable = [o for o in obs_infos
+                       if o.tool_name not in EXPLORATION_TOOLS
+                       and o.hash not in self._empty_hashes]
+        if len(actionable) < self.repeat_threshold:
             return StuckResult(is_stuck=False)
 
-        tail = observations[-self.repeat_threshold:]
-        if len(set(tail)) == 1:
+        tail = actionable[-self.repeat_threshold:]
+        if len(set(o.hash for o in tail)) == 1:
             return StuckResult(
                 is_stuck=True,
                 pattern="repeating_observation",
                 repeat_count=self.repeat_threshold,
-                detail=f"Same tool result repeated {self.repeat_threshold} times consecutively.",
+                detail=f"Same tool result repeated {self.repeat_threshold} times consecutively (from action tools).",
             )
         return StuckResult(is_stuck=False)
 
-    def _check_repeating_errors(self, observations: list[str]) -> StuckResult:
+    def _check_repeating_errors(self, obs_infos: list[_ObsInfo]) -> StuckResult:
         """Pattern 3: Same error hash repeated N times (not necessarily consecutive).
 
-        Scans the last 10 observations for any hash appearing >= threshold times.
-        This is a superset of the old Sisyphus detection.
+        Scans the last 10 non-exploration observations for any hash appearing
+        >= threshold times.  This is a superset of the old Sisyphus detection.
+        Empty results are excluded (same rationale as Pattern 2).
         """
-        recent = observations[-10:] if len(observations) > 10 else observations
+        actionable = [o for o in obs_infos
+                       if o.tool_name not in EXPLORATION_TOOLS
+                       and o.hash not in self._empty_hashes]
+        recent = actionable[-10:] if len(actionable) > 10 else actionable
         if len(recent) < self.repeat_threshold:
             return StuckResult(is_stuck=False)
 
-        # Count occurrences
-        from collections import Counter
-        counts = Counter(recent)
+        counts = Counter(o.hash for o in recent)
         for h, count in counts.most_common(1):
             if count >= self.repeat_threshold:
                 return StuckResult(
                     is_stuck=True,
                     pattern="repeating_error",
                     repeat_count=count,
-                    detail=f"Same tool output hash appeared {count} times in last {len(recent)} results.",
+                    detail=f"Same tool output hash appeared {count} times in last {len(recent)} action results.",
                 )
         return StuckResult(is_stuck=False)
 
@@ -206,7 +299,7 @@ class StuckDetector:
             )
         return StuckResult(is_stuck=False)
 
-    def _check_pair_cycle(self, actions: list[str], observations: list[str]) -> StuckResult:
+    def _check_pair_cycle(self, actions: list[_ActionInfo], observations: list[str]) -> StuckResult:
         """Pattern 5: Alternating (action, observation) pairs cycle.
 
         Detects patterns like: (A1,O1), (A2,O2), (A1,O1), (A2,O2), (A1,O1), (A2,O2)
@@ -217,8 +310,9 @@ class StuckDetector:
         if min_pairs < 6:
             return StuckResult(is_stuck=False)
 
-        # Build pairs from the tail
-        pairs = list(zip(actions[-6:], observations[-6:]))
+        # Build pairs from the tail (use action hash, not full _ActionInfo)
+        action_hashes = [a.hash for a in actions[-6:]]
+        pairs = list(zip(action_hashes, observations[-6:]))
 
         # Check if pairs[0]==pairs[2]==pairs[4] and pairs[1]==pairs[3]==pairs[5]
         even_same = pairs[0] == pairs[2] == pairs[4]

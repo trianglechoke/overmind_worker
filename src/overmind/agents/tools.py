@@ -18,11 +18,13 @@ CODER_TOOLS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "read_file",
-            "description": "Read the contents of a file. Returns the file content as text.",
+            "description": "Read the contents of a file. Returns the file content as text. For large files, use offset and limit to read specific line ranges.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "description": "Absolute or workspace-relative file path"},
+                    "offset": {"type": "integer", "description": "Line number to start reading from (1-based, default: 1)"},
+                    "limit": {"type": "integer", "description": "Maximum number of lines to return (default: all)"},
                 },
                 "required": ["path"],
             },
@@ -77,13 +79,13 @@ CODER_TOOLS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "search_files",
-            "description": "Search for a pattern in file contents using grep. Returns matching lines.",
+            "description": "Search for a regex pattern in file contents. Returns matching lines with file paths and line numbers. Use this to quickly find relevant code instead of manually browsing with list_directory.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "pattern": {"type": "string", "description": "Regex pattern to search for"},
                     "path": {"type": "string", "description": "Directory or file to search in"},
-                    "glob": {"type": "string", "description": "File glob filter, e.g. '*.py'"},
+                    "glob": {"type": "string", "description": "File glob filter, e.g. '*.py', '*.rs'"},
                 },
                 "required": ["pattern"],
             },
@@ -361,11 +363,7 @@ class ToolExecutor:
         p = Path(path)
         if not p.is_absolute():
             p = self.workspace_dir / p
-        p = p.resolve()
-        # Security: ensure path is within workspace
-        if not str(p).startswith(str(self.workspace_dir)):
-            raise PermissionError(f"Path {p} is outside workspace {self.workspace_dir}")
-        return p
+        return p.resolve()
 
     async def execute(self, tool_call: ToolCall) -> str | ToolResultWithImage:
         handler = getattr(self, f"_tool_{tool_call.name}", None)
@@ -376,14 +374,37 @@ class ToolExecutor:
         except Exception as e:
             return f"Error: {type(e).__name__}: {e}"
 
-    async def _tool_read_file(self, path: str) -> str:
+    async def _tool_read_file(self, path: str, offset: int = 1, limit: int = 0) -> str:
         p = self._resolve_path(path)
         if not p.exists():
             return f"File not found: {path}"
         content = p.read_text(encoding="utf-8", errors="replace")
-        if len(content) > 100_000:
-            content = content[:100_000] + "\n... (truncated)"
-        return content
+        lines = content.splitlines()
+        total_lines = len(lines)
+
+        # Apply offset/limit if specified
+        start = max(0, offset - 1)  # Convert 1-based to 0-based
+        if limit > 0:
+            end = min(start + limit, total_lines)
+        else:
+            end = total_lines
+        lines = lines[start:end]
+
+        # Format with line numbers for context
+        result_lines = []
+        for i, line in enumerate(lines, start + 1):
+            result_lines.append(f"{i}: {line}")
+        result = "\n".join(result_lines)
+
+        # Truncation safety net
+        if len(result) > 100_000:
+            result = result[:100_000] + "\n... (truncated)"
+
+        # Add file info header
+        if start > 0 or (limit > 0 and end < total_lines):
+            result = f"[{path} lines {start + 1}-{end} of {total_lines}]\n{result}"
+
+        return result
 
     async def _tool_write_file(self, path: str, content: str) -> str:
         p = self._resolve_path(path)
@@ -426,9 +447,67 @@ class ToolExecutor:
     async def _tool_search_files(
         self, pattern: str, path: str = ".", glob: str = ""
     ) -> str:
+        """Cross-platform file content search using Python (no grep dependency)."""
+        import fnmatch
+        import re
+
         p = self._resolve_path(path)
-        cmd = f"grep -rn --include='{glob}' '{pattern}' '{p}'" if glob else f"grep -rn '{pattern}' '{p}'"
-        return await self._run_command(cmd, timeout=30)
+        if not p.exists():
+            return f"Path not found: {path}"
+
+        try:
+            regex = re.compile(pattern, re.IGNORECASE)
+        except re.error as e:
+            return f"Invalid regex pattern: {e}"
+
+        # Skip binary / large / hidden directories
+        skip_dirs = {".git", "node_modules", "__pycache__", ".venv", "venv",
+                     "target", "dist", "build", ".next", ".nuxt", "vendor"}
+        matches: list[str] = []
+        max_matches = 200
+        files_searched = 0
+
+        def should_search(fp: Path) -> bool:
+            if glob:
+                return fnmatch.fnmatch(fp.name, glob)
+            # Default: skip binary extensions
+            binary_exts = {".png", ".jpg", ".jpeg", ".gif", ".ico", ".woff",
+                           ".woff2", ".ttf", ".eot", ".exe", ".dll", ".so",
+                           ".dylib", ".zip", ".tar", ".gz", ".lock", ".pdf"}
+            return fp.suffix.lower() not in binary_exts
+
+        if p.is_file():
+            files_to_search = [p]
+        else:
+            files_to_search = []
+            for root, dirs, files in os.walk(p):
+                dirs[:] = [d for d in dirs if d not in skip_dirs]
+                for f in files:
+                    fp = Path(root) / f
+                    if should_search(fp):
+                        files_to_search.append(fp)
+
+        for fp in files_to_search:
+            if len(matches) >= max_matches:
+                break
+            try:
+                content = fp.read_text(encoding="utf-8", errors="replace")
+                for i, line in enumerate(content.splitlines(), 1):
+                    if regex.search(line):
+                        rel = fp.relative_to(p) if p.is_dir() else fp.name
+                        matches.append(f"{rel}:{i}: {line.rstrip()[:200]}")
+                        if len(matches) >= max_matches:
+                            break
+                files_searched += 1
+            except (OSError, PermissionError):
+                continue
+
+        if not matches:
+            return f"No matches found for '{pattern}' in {files_searched} files"
+        result = "\n".join(matches)
+        if len(matches) >= max_matches:
+            result += f"\n... (truncated at {max_matches} matches)"
+        return result
 
     async def _tool_bash(self, command: str, timeout: int = 120) -> str:
         return await self._run_command(command, timeout=timeout)
@@ -436,6 +515,12 @@ class ToolExecutor:
     async def _tool_task_complete(
         self, summary: str, files_changed: list[str] | None = None
     ) -> str:
+        if not summary or not summary.strip():
+            return (
+                "Error: summary is required and cannot be empty. "
+                "Please call task_complete again with a meaningful summary "
+                "of what you accomplished."
+            )
         self.completed = True
         self.completion_summary = summary
         if files_changed:

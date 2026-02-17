@@ -28,6 +28,7 @@ log = logging.getLogger(__name__)
 READONLY_TOOLS = frozenset({
     "read_file", "list_directory", "search_files",
     "screenshot", "list_windows", "find_window",
+    "get_child_result",
 })
 
 # Kimi K2.5 context window size (tokens)
@@ -319,12 +320,14 @@ class LLMClient:
                     tool_calls_raw: dict[str, dict[str, Any]] = {}
                     finish_reason = ""
                     usage: dict[str, Any] = {}
+                    stream_done = False
 
                     async for line in resp.aiter_lines():
                         if not line.startswith("data: "):
                             continue
                         data_str = line[6:]
                         if data_str == "[DONE]":
+                            stream_done = True
                             break
                         try:
                             data = json.loads(data_str)
@@ -361,6 +364,14 @@ class LLMClient:
                             if func.get("arguments"):
                                 tool_calls_raw[idx]["arguments"] += func["arguments"]
                                 await on_chunk("tool_call", f"{tool_calls_raw[idx]['name']}: {func['arguments'][-50:]}")
+
+                    # Detect stream interruption: no [DONE], no finish_reason, and no content
+                    if not stream_done and not finish_reason and not content_parts and not tool_calls_raw:
+                        log.warning("Stream interrupted (no [DONE], no content, attempt %d/%d)", attempt + 1, max_retries + 1)
+                        if attempt < max_retries:
+                            await asyncio.sleep(2 ** attempt)
+                            continue  # retry
+                        raise LLMApiError("Stream interrupted: no [DONE] received and empty response", retryable=False)
 
                     if usage:
                         self.cost_tracker.record(usage)
@@ -503,6 +514,7 @@ class LLMClient:
         on_llm_start: Callable[[], Awaitable[None]] | None = None,
         on_llm_chunk: Callable[[str, str], Awaitable[None]] | None = None,
         is_cancelled: Callable[[], bool] | None = None,
+        is_completed: Callable[[], bool] | None = None,
         get_steered_messages: Callable[[], list[str]] | None = None,
         initial_messages: list[dict[str, Any]] | None = None,
         max_cost_usd: float = 5.0,
@@ -534,6 +546,7 @@ class LLMClient:
                 {"role": "user", "content": user_prompt},
             ]
         iteration = 0
+        empty_retries = 0
         cost_at_start = self.cost_tracker.total_cost_usd
         stuck_detector = StuckDetector()
         compact_threshold_tokens = int(
@@ -605,6 +618,19 @@ class LLMClient:
                 )
 
             if not response.has_tool_calls:
+                # If the LLM returned completely empty (no content, no tool_calls)
+                # and we're early in the loop, it might be a transient issue — retry once.
+                is_empty = not response.content and not response.reasoning
+                if is_empty and iteration <= 3 and empty_retries < 1:
+                    log.warning(
+                        "LLM returned empty response at iteration %d (no content, no tool_calls). "
+                        "Retrying once.",
+                        iteration,
+                    )
+                    # Remove the empty assistant message we just appended
+                    messages.pop()
+                    empty_retries += 1
+                    continue  # retry the LLM call
                 break
 
             # --- Execute tool calls ---
@@ -652,6 +678,11 @@ class LLMClient:
                 iteration, max_iterations,
                 tool_calls[-1].name if tool_calls else "none",
             )
+
+            # --- Early exit if task_complete was called ---
+            if is_completed and is_completed():
+                log.info("Agent task_complete detected, exiting loop at iteration %d", iteration)
+                break
 
             # --- Stuck detection (5 patterns) ---
             stuck_result = stuck_detector.check(messages)
