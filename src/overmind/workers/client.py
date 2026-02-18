@@ -408,6 +408,57 @@ class WorkerClient:
                 "image_base64": None,
             }))
 
+    async def _handle_file_read(self, ws: Any, msg: dict) -> None:
+        """Read a file as base64 and send it back."""
+        request_id = msg.get("request_id", "?")
+        file_path = msg.get("file_path", "")
+
+        try:
+            import base64
+            import mimetypes
+
+            path = Path(file_path)
+            if not path.exists():
+                await ws.send(json.dumps({
+                    "type": "file_read_result",
+                    "request_id": request_id,
+                    "ok": False,
+                    "error": f"File not found: {file_path}",
+                }))
+                return
+
+            size = path.stat().st_size
+            if size > 10 * 1024 * 1024:
+                await ws.send(json.dumps({
+                    "type": "file_read_result",
+                    "request_id": request_id,
+                    "ok": False,
+                    "error": f"File too large: {size} bytes (limit 10MB)",
+                }))
+                return
+
+            data = base64.b64encode(path.read_bytes()).decode()
+            mime = mimetypes.guess_type(str(path))[0] or "application/octet-stream"
+
+            await ws.send(json.dumps({
+                "type": "file_read_result",
+                "request_id": request_id,
+                "ok": True,
+                "data": data,
+                "size": size,
+                "mime": mime,
+            }))
+            log.info("File read: %s (%d bytes, %s) [%s]", file_path, size, mime, request_id)
+
+        except Exception as e:
+            log.exception("File read failed: %s", file_path)
+            await ws.send(json.dumps({
+                "type": "file_read_result",
+                "request_id": request_id,
+                "ok": False,
+                "error": f"{type(e).__name__}: {e}",
+            }))
+
     # ── Main Connection Loop ──────────────────────────────────────────────
 
     async def run(self) -> None:
@@ -489,6 +540,8 @@ class WorkerClient:
                         asyncio.create_task(self._handle_tool_call(ws, msg))
                     elif msg_type == "opencode_http":
                         asyncio.create_task(self._handle_opencode_http(ws, msg))
+                    elif msg_type == "file_read":
+                        asyncio.create_task(self._handle_file_read(ws, msg))
                     elif msg_type == "ping":
                         await ws.send(json.dumps({"type": "pong"}))
                     else:
