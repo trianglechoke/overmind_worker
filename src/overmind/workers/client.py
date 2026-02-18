@@ -507,11 +507,20 @@ class WorkerClient:
         ws = self._current_ws
         if ws:
             try:
-                asyncio.get_event_loop().call_soon_threadsafe(
-                    ws.transport.close if hasattr(ws, 'transport') and ws.transport else lambda: None
-                )
+                # Schedule an async close on the event loop
+                loop = asyncio.get_event_loop()
+                loop.call_soon_threadsafe(asyncio.ensure_future, ws.close())
             except Exception:
                 pass
+            # Also try transport close as fallback
+            try:
+                if hasattr(ws, 'transport') and ws.transport:
+                    asyncio.get_event_loop().call_soon_threadsafe(ws.transport.close)
+            except Exception:
+                pass
+        # Cancel SSE task if running
+        if self._sse_task and not self._sse_task.done():
+            self._sse_task.cancel()
 
 
 def main() -> None:
