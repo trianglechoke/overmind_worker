@@ -122,7 +122,7 @@ class WorkerClient:
             opencode_bin = shutil.which("opencode") or "opencode"
             # On Windows, npm installs .CMD wrappers that can't be exec'd directly
             if sys.platform == "win32" and opencode_bin.lower().endswith((".cmd", ".bat")):
-                cmd = [opencode_bin, "serve", "--port", str(self._opencode_port), "--hostname", "127.0.0.1"]
+                cmd = [opencode_bin, "serve", "--port", str(self._opencode_port), "--hostname", "0.0.0.0"]
                 self._opencode_process = await asyncio.create_subprocess_shell(
                     " ".join(cmd),
                     env=env,
@@ -134,7 +134,7 @@ class WorkerClient:
                 self._opencode_process = await asyncio.create_subprocess_exec(
                     opencode_bin, "serve",
                     "--port", str(self._opencode_port),
-                    "--hostname", "127.0.0.1",
+                    "--hostname", "0.0.0.0",
                     env=env,
                     cwd=str(self.workspace_dir),
                     stdout=asyncio.subprocess.PIPE,
