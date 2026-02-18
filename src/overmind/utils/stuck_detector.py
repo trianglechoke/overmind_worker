@@ -81,10 +81,20 @@ class StuckDetector:
     ):
         self.repeat_threshold = repeat_threshold
         self.scan_window = scan_window
+        self._message_offset = 0
         # Pre-compute hashes for empty results so we can skip them cheaply
         self._empty_hashes = frozenset(
             self._observation_hash(r) for r in EMPTY_RESULTS
         )
+
+    def set_message_offset(self, offset: int) -> None:
+        """Set the message offset for continuation runs.
+
+        When an agent is continued, old messages from the prior run can
+        cause false-positive stuck detection. Setting the offset tells
+        the detector to only analyze messages after this index.
+        """
+        self._message_offset = offset
 
     def check(self, messages: list[dict]) -> StuckResult:
         """Check if the conversation shows signs of being stuck.
@@ -95,8 +105,10 @@ class StuckDetector:
         Returns:
             StuckResult with is_stuck=True and pattern details if stuck.
         """
+        # Skip messages from prior runs (continuation boundary)
+        relevant = messages[self._message_offset:]
         # Only look at recent messages
-        window = messages[-self.scan_window:] if len(messages) > self.scan_window else messages
+        window = relevant[-self.scan_window:] if len(relevant) > self.scan_window else relevant
 
         # Extract structured data from messages
         actions = self._extract_actions(window)

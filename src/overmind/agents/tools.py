@@ -5,12 +5,19 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 from pathlib import Path
 from typing import Any
 
 from overmind.utils.llm_client import ToolCall, ToolResultWithImage
 
 log = logging.getLogger(__name__)
+
+# Tool output truncation limits (matches OpenCode defaults)
+MAX_OUTPUT_LINES = 2000
+MAX_OUTPUT_BYTES = 50_000
+# Tools whose output should NOT be truncated
+_NO_TRUNCATE_TOOLS = {"send_to_boss"}
 
 # OpenRouter / OpenAI-compatible tool schema
 CODER_TOOLS: list[dict[str, Any]] = [
@@ -103,25 +110,6 @@ CODER_TOOLS: list[dict[str, Any]] = [
                     "timeout": {"type": "integer", "description": "Timeout in seconds (default 120)"},
                 },
                 "required": ["command"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "task_complete",
-            "description": "Signal that the task is complete. Provide a summary of what was done.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "summary": {"type": "string", "description": "Summary of completed work"},
-                    "files_changed": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "List of files that were modified",
-                    },
-                },
-                "required": ["summary"],
             },
         },
     },
@@ -274,6 +262,32 @@ GUI_TOOLS: list[dict[str, Any]] = [
 # Combined tool set for OPERATOR agents
 OPERATOR_TOOLS: list[dict[str, Any]] = CODER_TOOLS + GUI_TOOLS
 
+# Read-only tool set for EXPLORER agents (no write_file, no edit_file)
+_EXPLORER_BASH: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "bash",
+        "description": (
+            "Execute a read-only shell command. Use for git log, git diff, git blame, "
+            "find, type/cat, tree, etc. Do NOT run commands that modify files or state."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "command": {"type": "string", "description": "The shell command to execute (read-only)"},
+                "timeout": {"type": "integer", "description": "Timeout in seconds (default 120)"},
+            },
+            "required": ["command"],
+        },
+    },
+}
+
+# Pick read-only tools from CODER_TOOLS by name
+_EXPLORER_TOOL_NAMES = {"read_file", "list_directory", "search_files", "send_to_boss"}
+EXPLORER_TOOLS: list[dict[str, Any]] = [
+    t for t in CODER_TOOLS if t["function"]["name"] in _EXPLORER_TOOL_NAMES
+] + [_EXPLORER_BASH]
+
 # Tools for L1 agents to spawn child (L2) agents
 CHILD_AGENT_TOOLS: list[dict[str, Any]] = [
     {
@@ -297,8 +311,8 @@ CHILD_AGENT_TOOLS: list[dict[str, Any]] = [
                     },
                     "agent_type": {
                         "type": "string",
-                        "enum": ["CODER", "TESTER", "REVIEWER"],
-                        "description": "Type of child agent (OPERATOR not allowed for children)",
+                        "enum": ["CODER", "TESTER", "REVIEWER", "EXPLORER"],
+                        "description": "Type of child agent (OPERATOR not allowed for children). Use EXPLORER for read-only codebase search and analysis.",
                     },
                 },
                 "required": ["task_prompt", "agent_type"],
@@ -337,6 +351,8 @@ def get_agent_tools(agent_type_str: str, nesting_level: int = 0) -> list[dict[st
     """
     if agent_type_str == "OPERATOR":
         base = OPERATOR_TOOLS
+    elif agent_type_str == "EXPLORER":
+        base = EXPLORER_TOOLS
     else:
         base = CODER_TOOLS
 
@@ -354,8 +370,6 @@ class ToolExecutor:
         send_to_boss: Any | None = None,
     ):
         self.workspace_dir = workspace_dir.resolve()
-        self.completed = False
-        self.completion_summary = ""
         self.files_changed: list[str] = []
         self._send_to_boss = send_to_boss  # async callback: (text, image_data?) -> None
 
@@ -365,12 +379,92 @@ class ToolExecutor:
             p = self.workspace_dir / p
         return p.resolve()
 
-    async def execute(self, tool_call: ToolCall) -> str | ToolResultWithImage:
-        handler = getattr(self, f"_tool_{tool_call.name}", None)
-        if handler is None:
-            return f"Unknown tool: {tool_call.name}"
+    def _truncate_output(self, output: str, tool_name: str) -> str:
+        """Truncate large tool output, saving full version to file."""
+        if tool_name in _NO_TRUNCATE_TOOLS:
+            return output
+        lines = output.splitlines()
+        total_bytes = len(output.encode("utf-8", errors="replace"))
+        if len(lines) <= MAX_OUTPUT_LINES and total_bytes <= MAX_OUTPUT_BYTES:
+            return output
+
+        # Save full output to file
+        output_dir = self.workspace_dir / ".overmind" / "tool-output"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        filename = f"tool_{int(time.time())}_{tool_name}.txt"
+        output_path = output_dir / filename
+        output_path.write_text(output, encoding="utf-8", errors="replace")
+
+        # Truncate: keep first MAX_OUTPUT_LINES lines within byte budget
+        kept = []
+        byte_count = 0
+        for line in lines[:MAX_OUTPUT_LINES]:
+            line_bytes = len(line.encode("utf-8", errors="replace")) + 1
+            if byte_count + line_bytes > MAX_OUTPUT_BYTES:
+                break
+            kept.append(line)
+            byte_count += line_bytes
+
+        removed = len(lines) - len(kept)
+        truncated = "\n".join(kept)
+        truncated += (
+            f"\n\n...{removed} lines truncated...\n"
+            f"Full output saved to: {output_path}\n"
+            "Use search_files to search the full content, "
+            "or read_file with offset/limit to view specific sections."
+        )
+
+        # Cleanup old files (>7 days)
         try:
-            return await handler(**tool_call.arguments)
+            cutoff = time.time() - 7 * 86400
+            for old in output_dir.iterdir():
+                if old.stat().st_mtime < cutoff:
+                    old.unlink()
+        except Exception:
+            pass
+
+        return truncated
+
+    async def execute(self, tool_call: ToolCall) -> str | ToolResultWithImage:
+        # Check for malformed JSON args from LLM
+        if "_parse_error" in tool_call.arguments:
+            return (
+                f"Error: {tool_call.arguments['_parse_error']}\n"
+                "Please retry the tool call with valid JSON arguments."
+            )
+
+        # Try exact match first, then case-insensitive repair
+        name = tool_call.name
+        handler = getattr(self, f"_tool_{name}", None)
+        if handler is None:
+            # Case repair: Read_file → read_file, Bash → bash
+            lower = name.lower()
+            handler = getattr(self, f"_tool_{lower}", None)
+            if handler is not None:
+                log.warning("Repaired tool name: %s → %s", name, lower)
+                name = lower
+            else:
+                available = [
+                    a[6:] for a in dir(self)
+                    if a.startswith("_tool_") and callable(getattr(self, a))
+                ]
+                return (
+                    f"Tool '{name}' does not exist. "
+                    f"Available tools: {', '.join(sorted(available))}. "
+                    "Please retry with the correct tool name."
+                )
+        try:
+            result = await handler(**tool_call.arguments)
+            # Apply truncation to string results
+            if isinstance(result, str):
+                result = self._truncate_output(result, name)
+            return result
+        except TypeError as e:
+            # Handle unexpected keyword arguments gracefully
+            return (
+                f"Error calling {name}: {e}\n"
+                "Please check the argument names and try again."
+            )
         except Exception as e:
             return f"Error: {type(e).__name__}: {e}"
 
@@ -511,21 +605,6 @@ class ToolExecutor:
 
     async def _tool_bash(self, command: str, timeout: int = 120) -> str:
         return await self._run_command(command, timeout=timeout)
-
-    async def _tool_task_complete(
-        self, summary: str, files_changed: list[str] | None = None
-    ) -> str:
-        if not summary or not summary.strip():
-            return (
-                "Error: summary is required and cannot be empty. "
-                "Please call task_complete again with a meaningful summary "
-                "of what you accomplished."
-            )
-        self.completed = True
-        self.completion_summary = summary
-        if files_changed:
-            self.files_changed.extend(files_changed)
-        return "Task marked as complete."
 
     async def _tool_send_to_boss(
         self, message: str, image_path: str = "", take_screenshot: bool = False,

@@ -226,7 +226,11 @@ class LLMClient:
                     func = tc["function"]
                     args = func.get("arguments", "{}")
                     if isinstance(args, str):
-                        args = json.loads(args)
+                        try:
+                            args = json.loads(args)
+                        except json.JSONDecodeError as e:
+                            log.warning("Malformed tool args for %s: %s", func["name"], e)
+                            args = {"_parse_error": f"Invalid JSON arguments: {e}. Raw: {args[:200]}"}
                     tool_calls.append(ToolCall(
                         id=tc.get("id", ""),
                         name=func["name"],
@@ -383,8 +387,9 @@ class LLMClient:
                         if isinstance(args, str):
                             try:
                                 args = json.loads(args)
-                            except json.JSONDecodeError:
-                                args = {}
+                            except json.JSONDecodeError as e:
+                                log.warning("Malformed tool args for %s: %s", tc["name"], e)
+                                args = {"_parse_error": f"Invalid JSON arguments: {e}. Raw: {args[:200]}"}
                         tool_calls.append(ToolCall(
                             id=tc["id"] or f"tc_{idx}",
                             name=tc["name"],
@@ -424,17 +429,46 @@ class LLMClient:
         messages: list[dict[str, Any]],
         system: str,
     ) -> list[dict[str, Any]]:
-        """Compact old messages by summarizing them to free context space.
+        """Compact old messages by pruning tool outputs and summarizing.
 
-        Keeps the first user message and the last few messages intact,
-        replaces everything in between with a summary.
+        Step 1: Prune old tool result contents (protect recent 40K tokens).
+        Step 2: Summarize compacted middle section with structured template.
+        Keeps the first user message and last 6 messages intact.
         """
-        if len(messages) <= 6:
+        if len(messages) <= 8:
             return messages  # Too few to compact
 
-        # Keep first message (original task) and last 4 messages
+        # --- Step 1: Prune old tool outputs ---
+        # Protect the most recent 40K tokens worth of tool results
+        PRUNE_PROTECT_TOKENS = 40_000
+        recent_tool_tokens = 0
+        prune_boundary = len(messages)  # Index before which we prune
+
+        for i in range(len(messages) - 1, 0, -1):
+            msg = messages[i]
+            if msg.get("role") == "tool":
+                content = msg.get("content", "")
+                tokens = len(content) // 3 if isinstance(content, str) else 0
+                recent_tool_tokens += tokens
+                if recent_tool_tokens >= PRUNE_PROTECT_TOKENS:
+                    prune_boundary = i
+                    break
+
+        pruned_count = 0
+        for i in range(1, prune_boundary):  # Skip first message
+            msg = messages[i]
+            if msg.get("role") == "tool":
+                content = msg.get("content", "")
+                if isinstance(content, str) and len(content) > 200:
+                    messages[i] = {**msg, "content": "[output pruned to save context]"}
+                    pruned_count += 1
+
+        if pruned_count:
+            log.info("Pruned %d old tool outputs before compaction", pruned_count)
+
+        # --- Step 2: Summarize middle messages ---
         keep_head = 1
-        keep_tail = 4
+        keep_tail = 6
         to_summarize = messages[keep_head:-keep_tail]
 
         if not to_summarize:
@@ -446,12 +480,11 @@ class LLMClient:
             role = msg.get("role", "?")
             content = msg.get("content", "")
             if isinstance(content, list):
-                # Extract text from content blocks
                 content = " ".join(
                     b.get("text", "") for b in content
                     if isinstance(b, dict) and b.get("type") == "text"
                 )
-            if content:
+            if content and content != "[output pruned to save context]":
                 summary_text_parts.append(f"[{role}] {content[:500]}")
             for tc in msg.get("tool_calls", []):
                 func = tc.get("function", {})
@@ -459,17 +492,22 @@ class LLMClient:
                     f"[tool_call] {func.get('name', '?')}({func.get('arguments', '')[:100]})"
                 )
 
-        summary_input = "\n".join(summary_text_parts[-50:])  # limit input size
+        summary_input = "\n".join(summary_text_parts[-60:])
 
         try:
             summary_response = await self.chat(
                 messages=[{
                     "role": "user",
                     "content": (
-                        "Summarize the following agent conversation history concisely. "
-                        "Focus on: what was done, what files were changed, what errors occurred, "
-                        "and what the current state is. Keep it under 500 words.\n\n"
-                        f"{summary_input}"
+                        "Provide a detailed summary for continuing this conversation. "
+                        "Use this template:\n\n"
+                        "## Goal\nWhat is the user trying to accomplish?\n\n"
+                        "## Accomplished\nWhat work has been completed?\n\n"
+                        "## In Progress\nWhat's currently being worked on?\n\n"
+                        "## Relevant Files\nKey files read, modified, or created.\n\n"
+                        "## Key Discoveries\nImportant findings during the work.\n\n"
+                        "---\n\n"
+                        f"Conversation to summarize:\n{summary_input}"
                     ),
                 }],
                 max_tokens=2048,
@@ -478,21 +516,21 @@ class LLMClient:
             summary = summary_response.content
         except Exception as e:
             log.warning("Failed to generate compaction summary: %s", e)
-            # Fallback: just truncate
             summary = f"[Previous {len(to_summarize)} messages compacted - summary unavailable]"
 
         # Build compacted message list
         compacted = []
-        compacted.extend(messages[:keep_head])  # original task
+        compacted.extend(messages[:keep_head])
         compacted.append({
             "role": "user",
             "content": (
-                f"[Context compacted: {len(to_summarize)} messages summarized]\n\n"
+                f"[Context compacted: {len(to_summarize)} messages summarized, "
+                f"{pruned_count} tool outputs pruned]\n\n"
                 f"{summary}\n\n"
                 "Continue from where you left off."
             ),
         })
-        compacted.extend(messages[-keep_tail:])  # recent messages
+        compacted.extend(messages[-keep_tail:])
 
         old_tokens = _estimate_messages_tokens(messages, system)
         new_tokens = _estimate_messages_tokens(compacted, system)
@@ -514,7 +552,6 @@ class LLMClient:
         on_llm_start: Callable[[], Awaitable[None]] | None = None,
         on_llm_chunk: Callable[[str, str], Awaitable[None]] | None = None,
         is_cancelled: Callable[[], bool] | None = None,
-        is_completed: Callable[[], bool] | None = None,
         get_steered_messages: Callable[[], list[str]] | None = None,
         initial_messages: list[dict[str, Any]] | None = None,
         max_cost_usd: float = 5.0,
@@ -531,7 +568,7 @@ class LLMClient:
             on_llm_start: Callback before each LLM call (shows thinking status).
             on_llm_chunk: Callback for each streaming chunk (type, content).
             is_cancelled: Callback to check if the agent has been cancelled.
-            get_steered_messages: Callback to get injected messages from Boss mid-loop.
+            get_steered_messages: Callback to get injected messages mid-loop.
             initial_messages: If provided, use these messages instead of creating from user_prompt.
                 Used for agent continuation (continue_run) to preserve prior context.
             max_cost_usd: Maximum cost budget for this agent loop. Raises AgentBudgetExceeded
@@ -549,6 +586,8 @@ class LLMClient:
         empty_retries = 0
         cost_at_start = self.cost_tracker.total_cost_usd
         stuck_detector = StuckDetector()
+        if initial_messages is not None:
+            stuck_detector.set_message_offset(len(initial_messages))
         compact_threshold_tokens = int(
             (MODEL_CONTEXT_WINDOW - RESERVED_OUTPUT_TOKENS) * COMPACT_THRESHOLD
         )
@@ -565,7 +604,7 @@ class LLMClient:
                 for msg_text in steered:
                     messages.append({
                         "role": "user",
-                        "content": f"[Boss update] {msg_text}",
+                        "content": msg_text,
                     })
                     log.info("Injected steered message: %s", msg_text[:100])
 
@@ -678,11 +717,6 @@ class LLMClient:
                 iteration, max_iterations,
                 tool_calls[-1].name if tool_calls else "none",
             )
-
-            # --- Early exit if task_complete was called ---
-            if is_completed and is_completed():
-                log.info("Agent task_complete detected, exiting loop at iteration %d", iteration)
-                break
 
             # --- Stuck detection (5 patterns) ---
             stuck_result = stuck_detector.check(messages)
