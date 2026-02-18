@@ -412,6 +412,7 @@ class WorkerClient:
         """Read a file as base64 and send it back."""
         request_id = msg.get("request_id", "?")
         file_path = msg.get("file_path", "")
+        log.info("file_read request received: '%s' [%s]", file_path, request_id)
 
         try:
             import base64
